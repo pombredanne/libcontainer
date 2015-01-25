@@ -28,6 +28,11 @@ func init() {
 		Usage:  "display the container's network interfaces",
 		Action: nsenterIp,
 	}
+
+	argvs["setup"] = &rFunc{
+		Usage:  "finish setting up init before it is ready to exec",
+		Action: nsenterSetup,
+	}
 }
 
 func main() {
@@ -53,11 +58,12 @@ func main() {
 	app.Before = preload
 
 	app.Commands = []cli.Command{
+		configCommand,
 		execCommand,
 		initCommand,
-		statsCommand,
-		configCommand,
+		oomCommand,
 		pauseCommand,
+		statsCommand,
 		unpauseCommand,
 	}
 

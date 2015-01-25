@@ -13,7 +13,6 @@ import (
 	"github.com/docker/libcontainer"
 	"github.com/docker/libcontainer/apparmor"
 	"github.com/docker/libcontainer/console"
-	"github.com/docker/libcontainer/ipc"
 	"github.com/docker/libcontainer/label"
 	"github.com/docker/libcontainer/mount"
 	"github.com/docker/libcontainer/netlink"
@@ -49,6 +48,14 @@ func Init(container *libcontainer.Config, uncleanRootfs, consolePath string, pip
 		pipe.Close()
 	}()
 
+	if container.Namespaces.Contains(libcontainer.NEWUSER) {
+		return initUserNs(container, uncleanRootfs, consolePath, pipe, args)
+	} else {
+		return initDefault(container, uncleanRootfs, consolePath, pipe, args)
+	}
+}
+
+func initDefault(container *libcontainer.Config, uncleanRootfs, consolePath string, pipe *os.File, args []string) (err error) {
 	rootfs, err := utils.ResolveRootfs(uncleanRootfs)
 	if err != nil {
 		return err
@@ -65,7 +72,10 @@ func Init(container *libcontainer.Config, uncleanRootfs, consolePath string, pip
 	if err := json.NewDecoder(pipe).Decode(&networkState); err != nil {
 		return err
 	}
-
+	// join any namespaces via a path to the namespace fd if provided
+	if err := joinExistingNamespaces(container.Namespaces); err != nil {
+		return err
+	}
 	if consolePath != "" {
 		if err := console.OpenAndDup(consolePath); err != nil {
 			return err
@@ -79,28 +89,48 @@ func Init(container *libcontainer.Config, uncleanRootfs, consolePath string, pip
 			return fmt.Errorf("setctty %s", err)
 		}
 	}
-	if err := ipc.Initialize(container.IpcNsPath); err != nil {
-		return fmt.Errorf("setup IPC %s", err)
+
+	cloneFlags := GetNamespaceFlags(container.Namespaces)
+
+	if (cloneFlags & syscall.CLONE_NEWNET) == 0 {
+		if len(container.Networks) != 0 || len(container.Routes) != 0 {
+			return fmt.Errorf("unable to apply network parameters without network namespace")
+		}
+	} else {
+		if err := setupNetwork(container, networkState); err != nil {
+			return fmt.Errorf("setup networking %s", err)
+		}
+		if err := setupRoute(container); err != nil {
+			return fmt.Errorf("setup route %s", err)
+		}
 	}
-	if err := setupNetwork(container, networkState); err != nil {
-		return fmt.Errorf("setup networking %s", err)
-	}
-	if err := setupRoute(container); err != nil {
-		return fmt.Errorf("setup route %s", err)
+
+	if err := setupRlimits(container); err != nil {
+		return fmt.Errorf("setup rlimits %s", err)
 	}
 
 	label.Init()
 
-	if err := mount.InitializeMountNamespace(rootfs,
+	// InitializeMountNamespace() can be executed only for a new mount namespace
+	if (cloneFlags & syscall.CLONE_NEWNS) == 0 {
+		if container.MountConfig != nil {
+			return fmt.Errorf("mount config is set without mount namespace")
+		}
+	} else if err := mount.InitializeMountNamespace(rootfs,
 		consolePath,
 		container.RestrictSys,
+		0, // Default Root Uid
+		0, // Default Root Gid
 		(*mount.MountConfig)(container.MountConfig)); err != nil {
 		return fmt.Errorf("setup mount namespace %s", err)
 	}
 
 	if container.Hostname != "" {
+		if (cloneFlags & syscall.CLONE_NEWUTS) == 0 {
+			return fmt.Errorf("unable to set the hostname without UTS namespace")
+		}
 		if err := syscall.Sethostname([]byte(container.Hostname)); err != nil {
-			return fmt.Errorf("sethostname %s", err)
+			return fmt.Errorf("unable to sethostname %q: %s", container.Hostname, err)
 		}
 	}
 
@@ -114,6 +144,93 @@ func Init(container *libcontainer.Config, uncleanRootfs, consolePath string, pip
 
 	// TODO: (crosbymichael) make this configurable at the Config level
 	if container.RestrictSys {
+		if (cloneFlags & syscall.CLONE_NEWNS) == 0 {
+			return fmt.Errorf("unable to restrict access to kernel files without mount namespace")
+		}
+		if err := restrict.Restrict("proc/sys", "proc/sysrq-trigger", "proc/irq", "proc/bus"); err != nil {
+			return err
+		}
+	}
+
+	pdeathSignal, err := system.GetParentDeathSignal()
+	if err != nil {
+		return fmt.Errorf("get parent death signal %s", err)
+	}
+
+	if err := FinalizeNamespace(container); err != nil {
+		return fmt.Errorf("finalize namespace %s", err)
+	}
+
+	// FinalizeNamespace can change user/group which clears the parent death
+	// signal, so we restore it here.
+	if err := RestoreParentDeathSignal(pdeathSignal); err != nil {
+		return fmt.Errorf("restore parent death signal %s", err)
+	}
+
+	return system.Execv(args[0], args[0:], os.Environ())
+}
+
+func initUserNs(container *libcontainer.Config, uncleanRootfs, consolePath string, pipe *os.File, args []string) (err error) {
+	// clear the current processes env and replace it with the environment
+	// defined on the container
+	if err := LoadContainerEnvironment(container); err != nil {
+		return err
+	}
+
+	// We always read this as it is a way to sync with the parent as well
+	var networkState *network.NetworkState
+	if err := json.NewDecoder(pipe).Decode(&networkState); err != nil {
+		return err
+	}
+	// join any namespaces via a path to the namespace fd if provided
+	if err := joinExistingNamespaces(container.Namespaces); err != nil {
+		return err
+	}
+	if consolePath != "" {
+		if err := console.OpenAndDup("/dev/console"); err != nil {
+			return err
+		}
+	}
+	if _, err := syscall.Setsid(); err != nil {
+		return fmt.Errorf("setsid %s", err)
+	}
+	if consolePath != "" {
+		if err := system.Setctty(); err != nil {
+			return fmt.Errorf("setctty %s", err)
+		}
+	}
+
+	if container.WorkingDir == "" {
+		container.WorkingDir = "/"
+	}
+
+	if err := setupRlimits(container); err != nil {
+		return fmt.Errorf("setup rlimits %s", err)
+	}
+
+	cloneFlags := GetNamespaceFlags(container.Namespaces)
+
+	if container.Hostname != "" {
+		if (cloneFlags & syscall.CLONE_NEWUTS) == 0 {
+			return fmt.Errorf("unable to set the hostname without UTS namespace")
+		}
+		if err := syscall.Sethostname([]byte(container.Hostname)); err != nil {
+			return fmt.Errorf("unable to sethostname %q: %s", container.Hostname, err)
+		}
+	}
+
+	if err := apparmor.ApplyProfile(container.AppArmorProfile); err != nil {
+		return fmt.Errorf("set apparmor profile %s: %s", container.AppArmorProfile, err)
+	}
+
+	if err := label.SetProcessLabel(container.ProcessLabel); err != nil {
+		return fmt.Errorf("set process label %s", err)
+	}
+
+	if container.RestrictSys {
+		if (cloneFlags & syscall.CLONE_NEWNS) == 0 {
+			return fmt.Errorf("unable to restrict access to kernel files without mount namespace")
+		}
 		if err := restrict.Restrict("proc/sys", "proc/sysrq-trigger", "proc/irq", "proc/bus"); err != nil {
 			return err
 		}
@@ -166,7 +283,7 @@ func RestoreParentDeathSignal(old int) error {
 }
 
 // SetupUser changes the groups, gid, and uid for the user inside the container
-func SetupUser(u string) error {
+func SetupUser(container *libcontainer.Config) error {
 	// Set up defaults.
 	defaultExecUser := user.ExecUser{
 		Uid:  syscall.Getuid(),
@@ -174,22 +291,24 @@ func SetupUser(u string) error {
 		Home: "/",
 	}
 
-	passwdFile, err := user.GetPasswdFile()
+	passwdPath, err := user.GetPasswdPath()
 	if err != nil {
 		return err
 	}
 
-	groupFile, err := user.GetGroupFile()
+	groupPath, err := user.GetGroupPath()
 	if err != nil {
 		return err
 	}
 
-	execUser, err := user.GetExecUserFile(u, &defaultExecUser, passwdFile, groupFile)
+	execUser, err := user.GetExecUserPath(container.User, &defaultExecUser, passwdPath, groupPath)
 	if err != nil {
 		return fmt.Errorf("get supplementary groups %s", err)
 	}
 
-	if err := syscall.Setgroups(execUser.Sgids); err != nil {
+	suppGroups := append(execUser.Sgids, container.AdditionalGroups...)
+
+	if err := syscall.Setgroups(suppGroups); err != nil {
 		return fmt.Errorf("setgroups %s", err)
 	}
 
@@ -238,6 +357,16 @@ func setupRoute(container *libcontainer.Config) error {
 	return nil
 }
 
+func setupRlimits(container *libcontainer.Config) error {
+	for _, rlimit := range container.Rlimits {
+		l := &syscall.Rlimit{Max: rlimit.Hard, Cur: rlimit.Soft}
+		if err := syscall.Setrlimit(rlimit.Type, l); err != nil {
+			return fmt.Errorf("error setting rlimit type %v: %v", rlimit.Type, err)
+		}
+	}
+	return nil
+}
+
 // FinalizeNamespace drops the caps, sets the correct user
 // and working dir, and closes any leaky file descriptors
 // before execing the command inside the namespace
@@ -259,7 +388,7 @@ func FinalizeNamespace(container *libcontainer.Config) error {
 		return fmt.Errorf("set keep caps %s", err)
 	}
 
-	if err := SetupUser(container.User); err != nil {
+	if err := SetupUser(container); err != nil {
 		return fmt.Errorf("setup user %s", err)
 	}
 
@@ -290,6 +419,25 @@ func LoadContainerEnvironment(container *libcontainer.Config) error {
 		}
 		if err := os.Setenv(p[0], p[1]); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// joinExistingNamespaces gets all the namespace paths specified for the container and
+// does a setns on the namespace fd so that the current process joins the namespace.
+func joinExistingNamespaces(namespaces []libcontainer.Namespace) error {
+	for _, ns := range namespaces {
+		if ns.Path != "" {
+			f, err := os.OpenFile(ns.Path, os.O_RDONLY, 0)
+			if err != nil {
+				return err
+			}
+			err = system.Setns(f.Fd(), uintptr(namespaceInfo[ns.Type]))
+			f.Close()
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
